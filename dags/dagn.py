@@ -5,6 +5,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 import json
 import duckdb
+import datetime
 
 URL_SKY = "https://opensky-network.org/api/states/all?extended=true"
 URL_TOKEN = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
@@ -31,7 +32,7 @@ cols = [
             "category",
         ]
 DAT_FILE_NAME = "/opt/airflow/dags/data/data.json"
-
+DB_PATH = "/opt/airflow/dags/data/bdd_flight.duckdb"
 
 '''
 Get access token from OpenSky API
@@ -110,57 +111,83 @@ def get_flight_data(colonnes,url,file_data_name):
 
 
 @task()
-def load_data():
+def extract_data():
     get_flight_data(cols,URL_SKY,DAT_FILE_NAME)
 
 @task()
 def check_nb():
-    print("how many number!")
+
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        nbr_raw = con.sql("""select count(*) as nbr_raw from bdd_flight.main.openskynetwork_brute""")
+        print("Number of raw records in the table:", nbr_raw.fetchall()[0][0])
+    except Exception as e:
+        print(f"An error occurred : {e}")
+    finally:
+        if con:
+            con.close()
+
 
 @task()
 def check_duplicate():
-    print("how many duplication!")    
-
-
-def save_dataooooooooo(file_name=DAT_FILE_NAME):
-    con = duckdb.connect('dags/data/bdd_flight')
-    con.sql(f"INSERT INTO TABLE bd_flight.main.openskynetwork_brute SELECT * FROM '{file_name}'");     
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        nbre_duplicates = con.sql("""SELECT callsign,time_position,last_contact,COUNT(*) AS duplicate_count
+        FROM bdd_flight.main.openskynetwork_brute GrOUP BY callsign,time_position,last_contact HAVING COUNT(*) > 1;
+    """)    
+        print("Number of duplicate records in the table ops:", nbre_duplicates.fetchall())
+        print("Number of duplicate records in the table:", nbre_duplicates.fetchall()[0][0])
+    except Exception as e:
+        print(f"An error occurred : {e}")
+    finally:
+        if con:
+            con.close()
     
-
-DB_PATH = "/opt/airflow/dags/data/bd_flight"
-
-
 
 @task()
 def save_data():
-    DB_PATH = "/opt/airflow/dags/data/bdd_flight.duckdb"
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH, read_only=False)
+        con.sql("""
+            CREATE SCHEMA IF NOT EXISTS bdd_flight.main;
+        """)
 
-    con = duckdb.connect(DB_PATH, read_only=False)
-    con.sql("""
-        CREATE SCHEMA IF NOT EXISTS bdd_flight.main;
-    """)
+        con.sql(f"""
+            CREATE TABLE IF NOT EXISTS bdd_flight.main.openskynetwork_brute AS 
+            SELECT * FROM read_json_auto('{DAT_FILE_NAME}') LIMIT 0;
+        """)
 
-    con.sql(f"""
-        CREATE TABLE IF NOT EXISTS bdd_flight.main.openskynetwork_brute AS 
-        SELECT * FROM read_json_auto('{DAT_FILE_NAME}') LIMIT 0;
-    """)
+        con.sql(f"""
+            INSERT INTO bdd_flight.main.openskynetwork_brute
+            SELECT * FROM read_json_auto('{DAT_FILE_NAME}');
+        """)
+        print("Data saved successfully to DuckDB.")
+    except Exception as e:
+        print(f"An error occurred while saving data: {e}")  
+    finally:
+        if con:
+            con.close()
+    
 
-    con.sql(f"""
-        INSERT INTO bdd_flight.main.openskynetwork_brute
-        SELECT * FROM read_json_auto('{DAT_FILE_NAME}');
-    """)
 
 
 
 
-@dag()
-def my_sample_dag():
+@dag(
+        schedule= "*/2 * * * *",   # toutes les 2 minutes   
+        start_date =datetime.datetime(2025, 11, 25),
+        catchup=False, 
+        )
+def extract_load_process():
     (
     EmptyOperator(task_id='start')
-    >> load_data()
+    >> extract_data()
     >> save_data()
     >> [check_nb(), check_duplicate()]
     >> EmptyOperator(task_id='end')
     )
 
-dag_instance = my_sample_dag()
+dag_instance = extract_load_process()
